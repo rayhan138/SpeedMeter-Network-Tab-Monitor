@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "SpeedMeter Overlay",
+  "version": "0.4.0",
+  "description": "Floating browser performance overlay with precision all-tab network monitoring and exact file download speed.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "downloads",
+    "notifications",
+    "debugger"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Toggle SpeedMeter"
+  },
+  "options_page": "options.html",
+  "commands": {
+    "toggle-overlay": {
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
+      "description": "Toggle SpeedMeter overlay"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
