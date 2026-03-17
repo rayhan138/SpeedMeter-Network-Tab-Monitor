@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SpeedMeter Overlay",
-  "version": "0.4.0",
-  "description": "Floating browser performance overlay with precision all-tab network monitoring and exact file download speed.",
+  "version": "0.4.1",
+  "description": "Floating browser performance overlay with precision all-tab network monitoring, improved upload tracking, and exact file download speed.",
   "permissions": [
     "tabs",
     "storage",
@@ -41,6 +41,12 @@
     }
   },
   "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["pageHookMain.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],

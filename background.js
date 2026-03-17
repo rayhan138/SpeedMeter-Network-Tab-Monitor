@@ -26,6 +26,8 @@ const ICON_DATA_URL =
   `);
 
 const encoder = new TextEncoder();
+const BUCKET_MS = 250;
+const NET_KEEP_MS = 15000;
 
 const state = {
   settings: normalizeSettings(DEFAULT_SETTINGS),
@@ -33,6 +35,7 @@ const state = {
   downloads: new Map(),
   debuggerTabs: new Map(),
   recentNetBuckets: new Map(),
+  pageUploadRequests: new Map(),
   history: {
     download: [],
     upload: [],
@@ -151,6 +154,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (bucket.tabId === tabId) state.recentNetBuckets.delete(key);
   }
 
+  for (const [key] of state.pageUploadRequests.entries()) {
+    if (key.startsWith(`${tabId}|`)) state.pageUploadRequests.delete(key);
+  }
+
   maybeUpdateHistory();
 });
 
@@ -193,26 +200,14 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     switch (method) {
       case "Network.requestWillBeSent": {
         const requestId = params.requestId;
-        let req = tabDebug.requests.get(requestId);
 
         if (params.redirectResponse) {
           tabDebug.requests.delete(requestId);
-          req = undefined;
         }
 
-        if (!req) {
-          req = { rxCounted: 0, txCounted: false };
+        if (!tabDebug.requests.has(requestId)) {
+          tabDebug.requests.set(requestId, { rxCounted: 0 });
         }
-
-        if (!req.txCounted) {
-          const txBytes = estimateRequestBytes(params.request);
-          if (txBytes > 0) {
-            recordNetBytes(tabId, 0, txBytes);
-          }
-          req.txCounted = true;
-        }
-
-        tabDebug.requests.set(requestId, req);
         break;
       }
 
@@ -224,7 +219,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         );
 
         let req = tabDebug.requests.get(requestId);
-        if (!req) req = { rxCounted: 0, txCounted: true };
+        if (!req) req = { rxCounted: 0 };
+
         req.rxCounted += rxBytes;
         tabDebug.requests.set(requestId, req);
 
@@ -257,14 +253,18 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       case "Network.webSocketFrameReceived": {
         const payload = params.response?.payloadData || "";
         const rxBytes = utf8Bytes(payload);
-        if (rxBytes > 0) recordNetBytes(tabId, rxBytes, 0);
+        if (rxBytes > 0) {
+          recordNetBytes(tabId, rxBytes, 0);
+        }
         break;
       }
 
       case "Network.webSocketFrameSent": {
         const payload = params.response?.payloadData || "";
         const txBytes = utf8Bytes(payload);
-        if (txBytes > 0) recordNetBytes(tabId, 0, txBytes);
+        if (txBytes > 0) {
+          recordNetBytes(tabId, 0, txBytes);
+        }
         break;
       }
 
@@ -282,104 +282,6 @@ function utf8Bytes(value) {
   } catch (_) {
     return 0;
   }
-}
-
-function estimateRequestBytes(request = {}) {
-  let total = 0;
-
-  total += utf8Bytes(request.method || "");
-  total += utf8Bytes(request.url || "") + 16;
-
-  const headers = request.headers || {};
-  for (const [key, value] of Object.entries(headers)) {
-    total += utf8Bytes(key) + utf8Bytes(String(value)) + 4;
-  }
-
-  if (typeof request.postData === "string") {
-    total += utf8Bytes(request.postData);
-  } else {
-    const contentLength =
-      headers["Content-Length"] ||
-      headers["content-length"] ||
-      headers["CONTENT-LENGTH"];
-
-    if (contentLength && Number.isFinite(Number(contentLength))) {
-      total += Number(contentLength);
-    }
-  }
-
-  return total;
-}
-
-function recordNetBytes(tabId, rxBytes = 0, txBytes = 0) {
-  rxBytes = Math.max(0, Math.round(Number(rxBytes) || 0));
-  txBytes = Math.max(0, Math.round(Number(txBytes) || 0));
-  if (!rxBytes && !txBytes) return;
-
-  const now = Date.now();
-  const bucketTs = now - (now % 250);
-  const key = `${tabId}|${bucketTs}`;
-
-  let bucket = state.recentNetBuckets.get(key);
-  if (!bucket) {
-    bucket = { ts: bucketTs, tabId, rx: 0, tx: 0 };
-    state.recentNetBuckets.set(key, bucket);
-  }
-
-  bucket.rx += rxBytes;
-  bucket.tx += txBytes;
-
-  state.sessionTotals.pageDownloadBytes += rxBytes;
-  state.sessionTotals.pageUploadBytes += txBytes;
-
-  cleanupNetBuckets(now);
-  maybeUpdateHistory();
-}
-
-function cleanupNetBuckets(now = Date.now()) {
-  for (const [key, bucket] of state.recentNetBuckets.entries()) {
-    if (now - bucket.ts > 15000) {
-      state.recentNetBuckets.delete(key);
-    }
-  }
-}
-
-function getRecentNetBps(windowMs = 1000) {
-  cleanupNetBuckets();
-  const now = Date.now();
-  let rx = 0;
-  let tx = 0;
-
-  for (const bucket of state.recentNetBuckets.values()) {
-    if (now - bucket.ts <= windowMs) {
-      rx += bucket.rx;
-      tx += bucket.tx;
-    }
-  }
-
-  return {
-    downloadBps: (rx * 1000) / windowMs,
-    uploadBps: (tx * 1000) / windowMs
-  };
-}
-
-function getTabNetBps(tabId, windowMs = 1000) {
-  cleanupNetBuckets();
-  const now = Date.now();
-  let rx = 0;
-  let tx = 0;
-
-  for (const bucket of state.recentNetBuckets.values()) {
-    if (bucket.tabId === tabId && now - bucket.ts <= windowMs) {
-      rx += bucket.rx;
-      tx += bucket.tx;
-    }
-  }
-
-  return {
-    downBps: (rx * 1000) / windowMs,
-    upBps: (tx * 1000) / windowMs
-  };
 }
 
 function isSupportedTabUrl(url = "") {
@@ -502,6 +404,233 @@ async function ensureDebuggerSweep(force = false) {
     }
   } catch (err) {
     console.error("ensureDebuggerSweep failed:", err);
+  }
+}
+
+function cleanupNetBuckets(now = Date.now()) {
+  for (const [key, bucket] of state.recentNetBuckets.entries()) {
+    if (now - bucket.ts > NET_KEEP_MS) {
+      state.recentNetBuckets.delete(key);
+    }
+  }
+}
+
+function addBucketBytes(tabId, rxBytes = 0, txBytes = 0, atTs = Date.now()) {
+  const bucketTs = atTs - (atTs % BUCKET_MS);
+  const key = `${tabId}|${bucketTs}`;
+
+  let bucket = state.recentNetBuckets.get(key);
+  if (!bucket) {
+    bucket = { ts: bucketTs, tabId, rx: 0, tx: 0 };
+    state.recentNetBuckets.set(key, bucket);
+  }
+
+  bucket.rx += rxBytes;
+  bucket.tx += txBytes;
+
+  cleanupNetBuckets(atTs);
+}
+
+function recordNetBytes(tabId, rxBytes = 0, txBytes = 0, atTs = Date.now()) {
+  rxBytes = Math.max(0, Number(rxBytes) || 0);
+  txBytes = Math.max(0, Number(txBytes) || 0);
+  if (!rxBytes && !txBytes) return;
+
+  addBucketBytes(tabId, rxBytes, txBytes, atTs);
+  state.sessionTotals.pageDownloadBytes += rxBytes;
+  state.sessionTotals.pageUploadBytes += txBytes;
+  maybeUpdateHistory();
+}
+
+function recordNetRange(tabId, rxBytes = 0, txBytes = 0, startTs = Date.now(), endTs = Date.now()) {
+  rxBytes = Math.max(0, Number(rxBytes) || 0);
+  txBytes = Math.max(0, Number(txBytes) || 0);
+  if (!rxBytes && !txBytes) return;
+
+  const safeStart = Number.isFinite(startTs) ? startTs : Date.now();
+  const safeEnd = Math.max(safeStart, Number.isFinite(endTs) ? endTs : safeStart);
+
+  const firstBucket = Math.floor(safeStart / BUCKET_MS) * BUCKET_MS;
+  const lastBucket = Math.floor(safeEnd / BUCKET_MS) * BUCKET_MS;
+  const bucketCount = Math.max(1, Math.floor((lastBucket - firstBucket) / BUCKET_MS) + 1);
+
+  const rxPerBucket = rxBytes / bucketCount;
+  const txPerBucket = txBytes / bucketCount;
+
+  for (let i = 0; i < bucketCount; i += 1) {
+    const ts = firstBucket + i * BUCKET_MS;
+    addBucketBytes(tabId, rxPerBucket, txPerBucket, ts);
+  }
+
+  state.sessionTotals.pageDownloadBytes += rxBytes;
+  state.sessionTotals.pageUploadBytes += txBytes;
+  maybeUpdateHistory();
+}
+
+function getRecentNetBps(windowMs = 1000) {
+  cleanupNetBuckets();
+  const now = Date.now();
+  let rx = 0;
+  let tx = 0;
+
+  for (const bucket of state.recentNetBuckets.values()) {
+    if (now - bucket.ts <= windowMs) {
+      rx += bucket.rx;
+      tx += bucket.tx;
+    }
+  }
+
+  return {
+    downloadBps: (rx * 1000) / windowMs,
+    uploadBps: (tx * 1000) / windowMs
+  };
+}
+
+function getTabNetBps(tabId, windowMs = 1000) {
+  cleanupNetBuckets();
+  const now = Date.now();
+  let rx = 0;
+  let tx = 0;
+
+  for (const bucket of state.recentNetBuckets.values()) {
+    if (bucket.tabId === tabId && now - bucket.ts <= windowMs) {
+      rx += bucket.rx;
+      tx += bucket.tx;
+    }
+  }
+
+  return {
+    downBps: (rx * 1000) / windowMs,
+    upBps: (tx * 1000) / windowMs
+  };
+}
+
+function pageUploadKey(tabId, requestId) {
+  return `${tabId}|${requestId}`;
+}
+
+function handleUploadProgressBatch(sender, events = []) {
+  const tabId = sender.tab?.id;
+  if (tabId == null) return;
+
+  for (const event of events) {
+    const requestId = event?.requestId || `anon-${Date.now()}`;
+    const key = pageUploadKey(tabId, requestId);
+
+    const req = state.pageUploadRequests.get(key) || {
+      kind: "xhr",
+      startTs: Number(event?.ts) || Date.now(),
+      estimatedBytes: Math.max(0, Number(event?.totalBytes) || 0),
+      accountedBytes: 0,
+      sawProgress: false
+    };
+
+    const deltaBytes = Math.max(0, Number(event?.deltaBytes) || 0);
+    const totalBytes = Math.max(0, Number(event?.totalBytes) || 0);
+    const ts = Number(event?.ts) || Date.now();
+
+    if (totalBytes > 0) {
+      req.estimatedBytes = Math.max(req.estimatedBytes || 0, totalBytes);
+    }
+
+    if (deltaBytes > 0) {
+      req.accountedBytes += deltaBytes;
+      req.sawProgress = true;
+      recordNetBytes(tabId, 0, deltaBytes, ts);
+    }
+
+    state.pageUploadRequests.set(key, req);
+  }
+}
+
+function handleUploadLifecycle(sender, payload = {}) {
+  const tabId = sender.tab?.id;
+  if (tabId == null) return;
+
+  const kind = payload.kind;
+  const ts = Number(payload.ts) || Date.now();
+
+  if (kind === "beacon" || kind === "form-submit") {
+    const bytes = Math.max(0, Number(payload.bytes) || 0);
+    if (bytes > 0) {
+      recordNetRange(tabId, 0, bytes, ts - 300, ts);
+    }
+    return;
+  }
+
+  const requestId = payload.requestId;
+  if (!requestId) return;
+
+  const key = pageUploadKey(tabId, requestId);
+
+  switch (kind) {
+    case "xhr-start": {
+      state.pageUploadRequests.set(key, {
+        kind: "xhr",
+        startTs: ts,
+        estimatedBytes: Math.max(0, Number(payload.estimatedBytes) || 0),
+        accountedBytes: 0,
+        sawProgress: false
+      });
+      break;
+    }
+
+    case "xhr-end": {
+      const req = state.pageUploadRequests.get(key) || {
+        kind: "xhr",
+        startTs: ts,
+        estimatedBytes: Math.max(0, Number(payload.estimatedBytes) || 0),
+        accountedBytes: 0,
+        sawProgress: false
+      };
+
+      const loaded = Math.max(0, Number(payload.loaded) || 0);
+
+      if (req.sawProgress) {
+        const missing = Math.max(0, loaded - (req.accountedBytes || 0));
+        if (missing > 0) {
+          recordNetBytes(tabId, 0, missing, ts);
+        }
+      } else {
+        const total = Math.max(req.estimatedBytes || 0, loaded);
+        if (total > 0) {
+          recordNetRange(tabId, 0, total, req.startTs || ts, ts);
+        }
+      }
+
+      state.pageUploadRequests.delete(key);
+      break;
+    }
+
+    case "fetch-start": {
+      state.pageUploadRequests.set(key, {
+        kind: "fetch",
+        startTs: ts,
+        estimatedBytes: Math.max(0, Number(payload.estimatedBytes) || 0),
+        accountedBytes: 0,
+        sawProgress: false
+      });
+      break;
+    }
+
+    case "fetch-end": {
+      const req = state.pageUploadRequests.get(key) || {
+        kind: "fetch",
+        startTs: ts,
+        estimatedBytes: Math.max(0, Number(payload.estimatedBytes) || 0)
+      };
+
+      const total = Math.max(0, Number(payload.estimatedBytes) || req.estimatedBytes || 0);
+      if (total > 0) {
+        recordNetRange(tabId, 0, total, req.startTs || ts, ts);
+      }
+
+      state.pageUploadRequests.delete(key);
+      break;
+    }
+
+    default:
+      break;
   }
 }
 
@@ -769,6 +898,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse(await buildSnapshot());
           break;
 
+        case "uploadProgressBatch":
+          handleUploadProgressBatch(sender, message.events || []);
+          sendResponse({ ok: true });
+          break;
+
+        case "uploadLifecycle":
+          handleUploadLifecycle(sender, message.payload || {});
+          sendResponse({ ok: true });
+          break;
+
         case "closeTab":
           if (Number.isInteger(message.tabId)) {
             await chrome.tabs.remove(message.tabId);
@@ -789,7 +928,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             if (tab) {
               await chrome.tabs.update(message.tabId, { active: true });
               if (tab.windowId != null) {
-                await chrome.windows.update(tab.windowId, { focused: true });
+                await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
               }
             }
           }

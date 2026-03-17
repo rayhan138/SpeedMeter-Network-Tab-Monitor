@@ -23,7 +23,9 @@
     position: null,
     drag: null,
     menuTabId: null,
-    refs: null
+    refs: null,
+    uploadProgressQueue: new Map(),
+    uploadFlushTimer: null
   };
 
   function normalizeSettings(input = {}) {
@@ -419,7 +421,7 @@
             <div class="metric">
               <div class="label">Upload</div>
               <div class="value" id="upRate">↑ 0 KB/s</div>
-              <div class="subtle" id="upNote">Live all tabs</div>
+              <div class="subtle" id="upNote">XHR exact + live all tabs</div>
             </div>
           </div>
 
@@ -485,6 +487,34 @@
   }
 
   function bindEvents() {
+    document.addEventListener("__speedmeter_upload_progress__", (event) => {
+      const detail = event.detail || {};
+      const requestId = detail.requestId || "anon";
+      const existing = state.uploadProgressQueue.get(requestId) || {
+        requestId,
+        deltaBytes: 0,
+        totalBytes: 0,
+        ts: Date.now()
+      };
+
+      existing.deltaBytes += Math.max(0, Number(detail.deltaBytes) || 0);
+      existing.totalBytes = Math.max(
+        existing.totalBytes || 0,
+        Math.max(0, Number(detail.total) || 0)
+      );
+      existing.ts = Number(detail.ts) || Date.now();
+
+      state.uploadProgressQueue.set(requestId, existing);
+      scheduleUploadFlush();
+    });
+
+    document.addEventListener("__speedmeter_upload_lifecycle__", (event) => {
+      chrome.runtime.sendMessage({
+        type: "uploadLifecycle",
+        payload: event.detail || {}
+      }).catch(() => {});
+    });
+
     state.refs.collapseBtn.addEventListener("click", async (event) => {
       event.stopPropagation();
       state.settings.collapsed = !state.settings.collapsed;
@@ -580,6 +610,31 @@
     });
   }
 
+  function scheduleUploadFlush() {
+    if (state.uploadFlushTimer) return;
+
+    state.uploadFlushTimer = setTimeout(() => {
+      flushUploadProgress();
+    }, 200);
+  }
+
+  function flushUploadProgress() {
+    if (state.uploadFlushTimer) {
+      clearTimeout(state.uploadFlushTimer);
+      state.uploadFlushTimer = null;
+    }
+
+    if (!state.uploadProgressQueue.size) return;
+
+    const events = [...state.uploadProgressQueue.values()];
+    state.uploadProgressQueue.clear();
+
+    chrome.runtime.sendMessage({
+      type: "uploadProgressBatch",
+      events
+    }).catch(() => {});
+  }
+
   function onDragStart(event) {
     if (event.button !== 0) return;
     if (event.target.closest("#collapseBtn")) return;
@@ -635,6 +690,8 @@
 
   async function refreshSnapshot() {
     try {
+      flushUploadProgress();
+
       const metrics = collectMetrics();
       const snapshot = await chrome.runtime.sendMessage({
         type: "reportTabMetrics",
@@ -757,14 +814,15 @@
       state.refs.downRate.textContent = `↓ ${formatRate(snapshot.speeds.downloadBps)}`;
       state.refs.upRate.textContent = `↑ ${formatRate(snapshot.speeds.uploadBps)}`;
     } else {
-      state.refs.meta.textContent = `Precision mode • all tabs aggregate`;
+      state.refs.meta.textContent = `Precision mode • improved upload tracking`;
       state.refs.downRate.textContent = formatRate(snapshot.speeds.downloadBps);
       state.refs.upRate.textContent = formatRate(snapshot.speeds.uploadBps);
     }
 
     state.refs.downNote.textContent =
       `Live all tabs + exact file downloads (${formatRate(snapshot.speeds.exactDownloadBps)} file downloads)`;
-    state.refs.upNote.textContent = `Live all tabs`;
+    state.refs.upNote.textContent =
+      `XHR upload progress + WebSocket live monitoring`;
 
     if (collapsed) {
       if (exactFile && exactFile.speedBps > 0) {
@@ -772,10 +830,10 @@
           `<div class="mini-strip-inner">File ↓ ${formatRate(exactFile.speedBps)} exact</div>`;
       } else if (topTab) {
         state.refs.miniStrip.innerHTML =
-          `<div class="mini-strip-inner">${escapeHtml(getHost(topTab.url))} • ↓ ${formatRate(topTab.downBps || 0)}</div>`;
+          `<div class="mini-strip-inner">${escapeHtml(getHost(topTab.url))} • ↑ ${formatRate(topTab.upBps || 0)}</div>`;
       } else {
         state.refs.miniStrip.innerHTML =
-          `<div class="mini-strip-inner">Live all-tab traffic</div>`;
+          `<div class="mini-strip-inner">Live upload/download monitoring</div>`;
       }
     } else {
       state.refs.miniStrip.innerHTML = "";
