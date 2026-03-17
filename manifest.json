@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "SpeedMeter Overlay",
   "version": "0.4.1",
-  "description": "Floating browser performance overlay with precision all-tab network monitoring, improved upload tracking, and exact file download speed.",
+  "description": "Floating browser overlay for live network monitoring, upload tracking, and exact file download speed.",
   "permissions": [
     "tabs",
     "storage",
