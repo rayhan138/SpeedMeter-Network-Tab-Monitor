@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS = {
 };
 
 const DEBUGGER_VERSION = "1.3";
+const WELCOME_PAGE_URL = "https://speedmeter.blinkeye.app";
 
 const ICON_DATA_URL =
   "data:image/svg+xml;charset=utf-8," +
@@ -79,8 +80,17 @@ function createTabEntry(tab = {}) {
   };
 }
 
+function resetSessionTotals() {
+  state.sessionTotals.pageDownloadBytes = 0;
+  state.sessionTotals.pageUploadBytes = 0;
+  state.sessionTotals.downloadManagerBytes = 0;
+}
+
+
 async function init() {
   try {
+    resetSessionTotals();
+    
     const stored = await chrome.storage.sync.get(DEFAULT_SETTINGS);
     state.settings = normalizeSettings(stored);
 
@@ -102,7 +112,7 @@ async function init() {
 
 init();
 
-chrome.runtime.onInstalled.addListener(async () => {
+chrome.runtime.onInstalled.addListener(async (details) => {
   try {
     const existing = await chrome.storage.sync.get(null);
     const merged = normalizeSettings(existing);
@@ -111,9 +121,19 @@ chrome.runtime.onInstalled.addListener(async () => {
   } catch (err) {
     console.error("onInstalled failed:", err);
   }
+
+  // Open welcome page on first install
+  if (details.reason === "install") {
+    try {
+      await chrome.tabs.create({ url: WELCOME_PAGE_URL });
+    } catch (err) {
+      console.error("Failed to open welcome page:", err);
+    }
+  }
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  resetSessionTotals();
   init();
 });
 
@@ -816,8 +836,6 @@ function getTotalEstimatedMemoryMB() {
 }
 
 function getTopTabs() {
-  const limit = Math.min(10, Math.max(5, Number(state.settings.tabsToShow) || 5));
-
   return [...state.tabs.entries()]
     .map(([tabId, tab]) => {
       const net = getTabNetBps(tabId, 1000);
@@ -833,8 +851,7 @@ function getTopTabs() {
       const bm = Number.isFinite(b.memoryMB) ? b.memoryMB : -1;
       if (bm !== am) return bm - am;
       return (b.downBps || 0) - (a.downBps || 0);
-    })
-    .slice(0, limit);
+    });
 }
 
 function pushHistory(name, value) {

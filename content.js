@@ -260,6 +260,18 @@
           gap: 6px;
         }
 
+        #tabsList {
+          max-height: 240px;
+          overflow-y: auto;
+          overflow-x: hidden;
+          scrollbar-width: none; /* Firefox */
+          -ms-overflow-style: none; /* IE and Edge */
+        }
+
+        #tabsList::-webkit-scrollbar {
+          display: none; /* Chrome, Safari, Opera */
+        }
+
         .row {
           display: grid;
           grid-template-columns: auto auto 1fr auto;
@@ -270,10 +282,6 @@
           border-radius: 10px;
           padding: 8px;
           cursor: pointer;
-        }
-
-        .row.top {
-          outline: 1px solid var(--accent);
         }
 
         .rank {
